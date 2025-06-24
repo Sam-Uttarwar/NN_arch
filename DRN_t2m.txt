@@ -160,7 +160,7 @@ for i in np.arange(0,10,1):
     #nn_aux_emb.summary()
     opt = Adam(learning_rate=1e-4)
     nn_aux_emb.compile(optimizer=opt, loss=crps_cost_function)
-    nn_aux_emb.fit([train_features, train_IDs], train_targets, epochs=10, batch_size=4096,verbose=1, validation_split=0.2)
+    nn_aux_emb.fit([train_features, train_IDs], train_targets, epochs=10, batch_size=4096,verbose=1, validation_split=0.1)
     # save the model
     nn_aux_emb.save('path to save the model/t2m_model_run_'+str(i))
     """Fit the model using the training data"""
