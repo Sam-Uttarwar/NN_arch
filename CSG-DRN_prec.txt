@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jun 24 12:05:32 2025
+
+@author: sameer.uttarwar
+"""
+
+# In[ ]:
+
+import pandas as pd
+import numpy as np
+
+# In[ ]:
+data = pd.read_feather("path to input dataframe")
+
+cols=['date','obs','prec','prec-sd','d2m','d2m-sd','u10','u10-sd','v10','v10-sd',
+      'u100','u100-sd','v100','v100-sd','tcc','tcc-sd','slhf','slhf-sd','sshf','sshf-sd','cp','cp-sd','ssr','ssr-sd',
+      'latitude','longitude','elevation',
+      'geopotential','elv-geo','lead','doy','sin-doy','stations']
+
+data=data[cols]
+
+train_end = data.date[data.date == '2011-01-01 12:00:00'].index.to_list()                 #testing data from 2011
+train_end = train_end[0]
+
+test_features_raw = data.iloc[train_end:,2:33-1].to_numpy()
+test_targets = data.iloc[train_end:,1].to_numpy()
+test_IDs = data.iloc[train_end:,33-1].to_numpy()
+
+train_features_raw = data.iloc[:train_end,2:33-1].to_numpy()      #all other features being considered
+train_targets = data.iloc[:train_end,1].to_numpy()              #observed data
+train_IDs = data.iloc[:train_end,33-1].to_numpy()                 #station numbers
+
+# In[ ]:
+doy = pd.Series(data.iloc[:,30]) #doy
+sindoy=pd.Series(data.iloc[:,31]) #sin-doy
+# normalize dataßß
+
+def normalize(data, method=None, shift=None, scale=None):
+    result = np.zeros(data.shape)
+    if method == "MAX":
+        scale = np.max(data, axis=0)
+        shift = np.zeros(scale.shape)
+    for index in range(len(data[0])):
+        result[:,index] = (data[:,index] - shift[index]) / scale[index]
+    return result, shift, scale
+
+train_features, train_shift, train_scale = normalize(train_features_raw[:,:], method="MAX")
+
+test_features = normalize(test_features_raw[:,:], shift=train_shift, scale=train_scale)[0]
+
+#adding the original doy back in to the train/test sets since they are already normalized
+
+train_features[:,29-1] = doy.iloc[:train_end]
+train_features[:,30-1] = sindoy.iloc[:train_end]
+
+test_features[:,29-1] = doy.iloc[train_end:]
+test_features[:,30-1] = sindoy.iloc[train_end:]
+
+del sindoy,doy,data
+
+#%% loss function for the CSG-DRN 
+#% sheuerer and hamill 2015
+# crps closed form according to https://journals.ametsoc.org/view/journals/mwre/143/11/mwr-d-15-0061.1.xml
+
+import scipy.stats as stats
+import scipy.special
+import tensorflow as tf
+
+def crps_cost_function(y_true, y_pred, theano=False):
+      """Compute the CRPS cost function for a csgd distribution defined by
+    the mean, std dev. and censored value delta.
+
+
+    Args:
+        y_true: True values
+        y_pred: Tensor containing predictions: [mean, std, delta]
+        theano: Set to true if using this with pure theano.
+
+    Returns:
+        mean_crps: Scalar with mean CRPS over batch
+    """
+    
+      mu = (y_pred[:, 0])
+      sigma = (y_pred[:, 1])
+      delta= -(y_pred[:,2])
+      
+    # Ugly workaround for different tensor allocation in keras and theano
+      if not theano:
+          y_true = y_true[:, 0]   # Need to also get rid of axis 1 to match!
+
+    # To stop sigma from becoming negative we first have to 
+    # convert it to the variance and then take the square
+    # root again. 
+      var = sigma ** 2
+    # obtain shape and scale from mu and sigma ref to the article
+      shape = (mu ** 2)/ var # shape is k
+      scale = (var / mu) # scale is theta
+    # some simplifickation according to https://journals.ametsoc.org/view/journals/mwre/143/11/mwr-d-15-0061.1.xml
+      c = (-delta/scale)
+      y = ((y_true - delta) / scale)
+
+      term1_cdf_value=stats.gamma.cdf(y, shape)
+      term2_cdf_value=(stats.gamma.cdf(c, shape)) **2
+      term3_cdf_value1=stats.gamma.cdf(c, shape)
+      term3_cdf_value2=stats.gamma.cdf(c,shape+1)
+      term4_cdf_value=term2_cdf_value
+      term5_cdf_value=stats.gamma.cdf(y, shape+1)
+      term6_cdf_value=stats.gamma.cdf(2.0 *c, 2.0 *shape)
+  
+    # The following three variables are just for convenience
+      term1 = (scale * y) * (2.0 * term1_cdf_value - 1)
+      term2 = (scale * c) * term2_cdf_value
+      term3 = (scale * shape) * (1.0 + 2.0 * term3_cdf_value1 * term3_cdf_value2 - term4_cdf_value - 2.0 * term5_cdf_value)
+      term6 = ((scale * shape)/3.14) * (scipy.special.beta(0.5, shape + 0.5)) * (1.0 - term6_cdf_value)
+    
+    # First we will compute the crps for each input/target pair
+      crps =  term1 - term2 + term3 - term6 
+    
+      return tf.math.reduce_mean(crps)
+
+#%% CSG-DRN for 1981-2014 with training on 1981-2010 and testing on 2011-2014
+
+import keras
+from tensorflow.keras import regularizers
+from tensorflow.keras.layers import Input, Dense, Embedding, Flatten, Concatenate
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam,SGD
+import tensorflow.compat.v1 as tfv
+from tensorflow.keras.backend import clear_session
+
+# training multiple models in a loop
+emb_size = 2
+max_id = int(tf.math.reduce_max([train_IDs.max(), test_IDs.max()]))     #max station ID across training or testing sets
+n_features = train_features.shape[1]                                    #1-D integer tensor representing the shape of input
+n_outputs = 3
+
+#nreps = 10
+trn_scores = []
+test_scores = []
+preds = []
+
+tf.keras.backend.clear_session()
+
+for i in np.arange(0,10,1):
+    print(i)
+    tf.keras.backend.clear_session()
+    tfv.reset_default_graph()
+    
+    features_in = Input(shape=(n_features,))
+    id_in = Input(shape=(1,))
+    emb = Embedding(max_id + 1, emb_size)(id_in)
+    
+    # callback = tf.keras.callbacks.EarlyStopping(monitor='loss', patience=3)
+    
+    emb = Flatten()(emb)
+    #flattens input to 1d array
+    
+    x = Concatenate()([features_in, emb])
+    #Layer that concatenates the list of inputs
+    #5,25,125,512,1024
+    x = Dense(25, activation='elu')(x) # ref article https://www.sciencedirect.com/science/article/pii/S0309170821000622?via%3Dihub
+    
+    x = Dense(n_outputs, activation='softplus')(x)
+
+    nn_aux_emb_prec = Model(inputs=[features_in, id_in], outputs=x)
+    #nn_aux_emb_prec.summary()
+    
+    opt = Adam(learning_rate=1e-5)
+
+    nn_aux_emb_prec.compile(optimizer=opt, loss=crps_cost_function, run_eagerly=True) 
+   
+    #batch_size=1250,4096 
+    nn_aux_emb_prec.fit([train_features, train_IDs], train_targets, epochs=10, batch_size=4096,verbose=2, validation_split=0.1)   
+    # save the model
+    nn_aux_emb_prec.save('path to save the model/prec_model_run'+str(i))
+    
+    """Fit the model using the training data"""
+    trn_scores.append(nn_aux_emb_prec.evaluate([train_features,train_IDs], train_targets, 4096, verbose=2))
+    test_scores.append(nn_aux_emb_prec.evaluate([test_features,test_IDs], test_targets, 4096, verbose=2))
+    """Evaluating the model on training and testing data sets"""
+    preds.append(nn_aux_emb_prec.predict([test_features,test_IDs], 4096, verbose=0))
+    
+#saving the pedictions inan array
+arr_10nrep = np.asarray(preds)
+np.save('path to save the array',arr_10nrep)
+
