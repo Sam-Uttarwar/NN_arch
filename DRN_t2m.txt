@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jun 24 11:52:24 2025
+
+@author: sameer.uttarwar
+"""
+
+# In[ ]:
+
+import pandas as pd
+import numpy as np
+
+# In[ ]:
+
+
+"""INPUT DATAFRAME"""
+
+path = 'path to the input dataframe'
+
+data = pd.read_feather(path)
+#put all standardized values in the end of the dataframe
+cols=['date','obs','t2m','t2m-sd','d2m','d2m-sd','u10','u10-sd','v10','v10-sd',
+      'u100','u100-sd','v100','v100-sd','tcc','tcc-sd','slhf','slhf-sd','sshf','sshf-sd',
+      'latitude','longitude','elevation',
+      'geopotential','elv-geo','lead','nao','ao','doy','stations']
+data=data[cols]
+
+train_end = data.date[data.date == '2011-01-01 12:00:00'].index.to_list()                 #testing data from 2010
+train_end = train_end[0]
+
+test_features_raw = data.iloc[train_end:,2:30-1].to_numpy() #training auxillary variables except date, obs, station(i.e. emb)
+test_targets = data.iloc[train_end:,1].to_numpy()
+test_IDs = data.iloc[train_end:,30-1].to_numpy()
+
+train_features_raw = data.iloc[:train_end,2:30-1].to_numpy()      #all other features being considered
+train_targets = data.iloc[:train_end,1].to_numpy()              #observed data
+train_IDs = data.iloc[:train_end,30-1].to_numpy()   
+
+#%%NORMALIZATION
+
+"""SOME VARIABLES WILL NOT BE NORMALIZED AGAIN. WE SAVE THEM HERE AND ADD THEM BACK
+TO THE DATAFRAME AFTER NORMALIZATION"""
+
+cosdoy = pd.Series(data.iloc[:,28]) #cosdoy
+nao=pd.Series(data.iloc[:,26]) #nao
+ao= pd.Series(data.iloc[:,27]) #ao
+
+# normalize dataßß
+def normalize(data, method=None, shift=None, scale=None):
+    result = np.zeros(data.shape)
+    if method == "MAX":
+        scale = np.max(data, axis=0)
+        shift = np.zeros(scale.shape)
+    for index in range(len(data[0])):
+        result[:,index] = (data[:,index] - shift[index]) / scale[index]
+    return result, shift, scale
+
+train_features, train_shift, train_scale = normalize(train_features_raw[:,:], method="MAX")
+
+test_features = normalize(test_features_raw[:,:], shift=train_shift, scale=train_scale)[0]
+
+train_features[:,25] = cosdoy.iloc[:train_end]
+train_features[:,23] = nao.iloc[:train_end]
+train_features[:,24] = ao.iloc[:train_end]
+
+test_features[:,25] = cosdoy.iloc[train_end:]
+test_features[:,23] = nao.iloc[train_end:]
+test_features[:,24] = ao.iloc[train_end:]
+
+del cosdoy,data
+
+# In[ ]:
+# helper functions for NN models
+import tensorflow as tf
+import keras
+from tensorflow.keras import regularizers
+from tensorflow.keras.layers import Input, Dense, Embedding, Flatten, Concatenate
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam,SGD
+
+def crps_cost_function(y_true, y_pred, theano=False):
+    """Compute the CRPS cost function for a normal distribution defined by
+    the mean and standard deviation.
+
+    Code inspired by Kai Polsterer (HITS).
+
+    Args:
+        y_true: True values
+        y_pred: Tensor containing predictions: [mean, std]
+        theano: Set to true if using this with pure theano.
+
+    Returns:
+        mean_crps: Scalar with mean CRPS over batch
+    """
+
+    # Split input
+    mu = y_pred[:, 0]
+    sigma = y_pred[:, 1]
+    # Ugly workaround for different tensor allocation in keras and theano
+    if not theano:
+        y_true = y_true[:, 0]   # Need to also get rid of axis 1 to match!
+
+    # To stop sigma from becoming negative we first have to 
+    # convert it the the variance and then take the square
+    # root again. 
+    var = sigma ** 2
+    # The following three variables are just for convenience
+    loc = (y_true - mu) / tf.sqrt(var)
+    phi = 1.0 / tf.sqrt(2.0 * np.pi) * tf.exp(-loc ** 2 / 2.0)
+    Phi = 0.5 * (1.0 + tf.math.erf(loc / tf.sqrt(2.0)))
+    # First we will compute the crps for each input/target pair
+    crps =  tf.sqrt(var) * (loc * (2. * Phi - 1.) + 2 * phi - 1. / tf.sqrt(np.pi))
+    # Then we take the mean. The cost is now a scalar
+    return tf.math.reduce_mean(crps)
+
+#%%DRN for t2m postprocessing
+
+import tensorflow as tf
+import keras
+from tensorflow.keras import regularizers
+from tensorflow.keras.layers import Input, Dense, Embedding, Flatten, Concatenate
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam,SGD
+import tensorflow.compat.v1 as tfv
+from tensorflow.keras.backend import clear_session
+# training multiple models in a loop
+
+emb_size = 2
+max_id = int(tf.math.reduce_max([train_IDs.max(), test_IDs.max()]))     #max station ID across training or testing sets
+n_features = train_features.shape[1]                                    #1-D integer tensor representing the shape of input
+n_outputs = 2
+
+# nreps = 10
+trn_scores = []
+test_scores = []
+preds = []
+
+tf.keras.backend.clear_session()
+
+for i in np.arange(0,10,1):
+    print(i)
+    tf.keras.backend.clear_session()
+    tfv.reset_default_graph()
+    features_in = Input(shape=(n_features,))
+    #embedding
+    id_in = Input(shape=(1,))
+    emb = Embedding(max_id + 1, emb_size)(id_in)
+    emb = Flatten()(emb)
+    #flattens input to 1d array
+    #can remove embedding from here if needed
+    x = Concatenate()([features_in, emb])
+    #Layer that concatenates the list of inputs
+    """Additional Dense layers can be added or removed here as seen fit"""
+    x = Dense(25, activation='relu')(x)
+    #second hidden layer of same config
+    #x = Dense(1024, activation='relu')(x)
+    x = Dense(n_outputs, activation='linear')(x)    #output layer
+    nn_aux_emb = Model(inputs=[features_in, id_in], outputs=x)
+    #nn_aux_emb.summary()
+    opt = Adam(learning_rate=1e-4)
+    nn_aux_emb.compile(optimizer=opt, loss=crps_cost_function)
+    nn_aux_emb.fit([train_features, train_IDs], train_targets, epochs=10, batch_size=4096,verbose=1, validation_split=0.2)
+    # save the model
+    nn_aux_emb.save('path to save the model/t2m_model_run_'+str(i))
+    """Fit the model using the training data"""
+    trn_scores.append(nn_aux_emb.evaluate([train_features, train_IDs], train_targets, 4096, verbose=2))
+    test_scores.append(nn_aux_emb.evaluate([test_features, test_IDs], test_targets, 4096, verbose=2))
+    """Evaluating the model on training and testing data sets"""
+    preds.append(nn_aux_emb.predict([test_features, test_IDs], 4096 , verbose=1))
+    """Predicting values for test period"""
+"""Saving array of predictions for further computations"""
+arr = np.asarray(preds)
+np.save('path to save the array',arr) 
+
+
+
+
